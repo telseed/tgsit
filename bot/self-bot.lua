@@ -1,321 +1,182 @@
-package.path = package.path .. ';.luarocks/share/lua/5.2/?.lua'
-  ..';.luarocks/share/lua/5.2/?/init.lua'
-package.cpath = package.cpath .. ';.luarocks/lib/lua/5.2/?.so'
-
-require("./bot/utils")
-
-local f = assert(io.popen('/usr/bin/git describe --tags', 'r'))
-VERSION = assert(f:read('*a'))
-f:close()
-
--- This function is called when tg receive a msg
-function on_msg_receive (msg)
-  if not started then
-    return
-  end
-
-  msg = backward_msg_format(msg)
-
-  local receiver = get_receiver(msg)
-  print(receiver)
-  --vardump(msg)
-  --vardump(msg)
-  msg = pre_process_service_msg(msg)
-  if msg_valid(msg) then
-    msg = pre_process_msg(msg)
-    if msg then
-      match_plugins(msg)
-      if redis:get("bot:markread") then
-        if redis:get("bot:markread") == "on" then
-          mark_read(receiver, ok_cb, false)
-        end
-      end
+JSON = require('dkjson')
+db = require('redis')
+redis = db.connect('127.0.0.1', 6379)
+tdcli = dofile('tdcli.lua')
+serpent = require('serpent')
+redis:select(2)
+gp = -000000000000
+sudo_users = {
+[999999999] = '[S][H][O][W][E][Y][E]',
+}--@Showeye
+function dl_cb(arg, data)
+  vardump(arg)
+  vardump(data)
+end
+function vardump(value)
+  print(serpent.block(value, {comment=false}))
+end
+function vardump2(value)
+  return serpent.block(value, {comment=true})
+end
+function is_sudo(msg)
+  local var = false
+  for k,v in pairs(sudo_users)do 
+    if k == msg.sender_user_id_  then
+      var = true
     end
-  end
-end
-
-function ok_cb(extra, success, result)
-
-end
-
-function on_binlog_replay_end()
-  started = true
-  postpone (cron_plugins, false, 60*5.0)
-  -- See plugins/isup.lua as an example for cron
-
-  _config = load_config()
-
-  -- load plugins
-  plugins = {}
-  load_plugins()
-end
-
-function msg_valid(msg)
-  -- Don't process outgoing messages
-  if msg.out then
-    print('\27[36mNot valid: msg from us\27[39m')
-    return true
-  end
-
-  -- Before bot was started
-  if msg.date < os.time() - 5 then
-    print('\27[36mNot valid: old msg\27[39m')
-    return false
-  end
-
-  if msg.unread == 0 then
-    print('\27[36mNot valid: readed\27[39m')
-    return false
-  end
-
-  if not msg.to.id then
-    print('\27[36mNot valid: To id not provided\27[39m')
-    return false
-  end
-
-  if not msg.from.id then
-    print('\27[36mNot valid: From id not provided\27[39m')
-    return false
-  end
-
-  if msg.from.id == our_id then
-    print('\27[36mNot valid: Msg from our id\27[39m')
-    return true
-  end
-
-  if msg.to.type == 'encr_chat' then
-    print('\27[36mNot valid: Encrypted chat\27[39m')
-    return false
-  end
-
-  if msg.from.id == 777000 then
-    --send_large_msg(*group id*, msg.text) *login code will be sent to GroupID*
-    return false
-  end
-
-  return true
-end
-
---
-function pre_process_service_msg(msg)
-   if msg.service then
-      local action = msg.action or {type=""}
-      -- Double ! to discriminate of normal actions
-      msg.text = "!!tgservice " .. action.type
-
-      -- wipe the data to allow the bot to read service messages
-      if msg.out then
-         msg.out = false
-      end
-      if msg.from.id == our_id then
-         msg.from.id = 0
-      end
-   end
-   return msg
-end
-
--- Apply plugin.pre_process function
-function pre_process_msg(msg)
-  for name,plugin in pairs(plugins) do
-    if plugin.pre_process and msg then
-      print('Preprocess', name)
-      msg = plugin.pre_process(msg)
-    end
-  end
-  return msg
-end
-
--- Go over enabled plugins patterns.
-function match_plugins(msg)
-  for name, plugin in pairs(plugins) do
-    match_plugin(plugin, name, msg)
-  end
-end
-
--- Check if plugin is on _config.disabled_plugin_on_chat table
-local function is_plugin_disabled_on_chat(plugin_name, receiver)
-  local disabled_chats = _config.disabled_plugin_on_chat
-  -- Table exists and chat has disabled plugins
-  if disabled_chats and disabled_chats[receiver] then
-    -- Checks if plugin is disabled on this chat
-    for disabled_plugin,disabled in pairs(disabled_chats[receiver]) do
-      if disabled_plugin == plugin_name and disabled then
-        local warning = 'Plugin '..disabled_plugin..' is disabled on this chat'
-        print(warning)
-        send_msg(receiver, warning, ok_cb, false)
-        return true
-      end
-    end
-  end
-  return false
-end
-
-function match_plugin(plugin, plugin_name, msg)
-  local receiver = get_receiver(msg)
-
-  -- Go over patterns. If one matches it's enough.
-  for k, pattern in pairs(plugin.patterns) do
-    local matches = match_pattern(pattern, msg.text)
-    if matches then
-      print("msg matches: ", pattern)
-
-      if is_plugin_disabled_on_chat(plugin_name, receiver) then
-        return nil
-      end
-      -- Function exists
-      if plugin.run then
-        -- If plugin is for privileged users only
-        if not warns_user_not_allowed(plugin, msg) then
-          local result = plugin.run(msg, matches)
-          if result then
-            send_large_msg(receiver, result)
-          end
-        end
-      end
-      -- One patterns matches
-      return
-    end
-  end
-end
-
--- DEPRECATED, use send_large_msg(destination, text)
-function _send_msg(destination, text)
-  send_large_msg(destination, text)
-end
-
--- Save the content of _config to config.lua
-function save_config( )
-  serialize_to_file(_config, './data/config.lua')
-  print ('saved config into ./data/config.lua')
-end
-
--- Returns the config from config.lua file.
--- If file doesn't exist, create it.
-function load_config( )
-  local f = io.open('./data/config.lua', "r")
-  -- If config.lua doesn't exist
-  if not f then
-    print ("Created new config file: data/config.lua")
-    create_config()
-  else
-    f:close()
-  end
-  local config = loadfile ("./data/config.lua")()
-  for v,user in pairs(config.sudo_users) do
-    print("Sudo user: " .. user)
-  end
-  return config
-end
-
--- Create a basic config.json file and saves it.
-function create_config( )
-  -- A simple config with basic plugins and ourselves as privileged user
-  config = {
-    enabled_plugins = {
-    "set",
-    "get",
-    "onservice",
-    "plugins",
-    "plugins",
-    "FunTools",
-    "id",
-    "help",
-    "dl-file",
-    "savefile",
-    "groupmanager",
-    "on-off",
-    "solid"
-    },
-    sudo_users = {350057145,132221010,tonumber(our_id)},--Sudo users
-    moderation = {data = 'data/moderation.json'},
-    about_text = [[]],
-    help_text_realm = [[]],
-    help_text = [[]],
-	help_text_super =[[]],
-  }
-  serialize_to_file(config, './data/config.lua')
-  print('saved config into ./data/config.lua')
-end
-
-function on_our_id (id)
-  our_id = id
-end
-
-function on_user_update (user, what)
-  --vardump (user)
-end
-
-function on_chat_update (chat, what)
-  --vardump (chat)
-end
-
-function on_secret_chat_update (schat, what)
-  --vardump (schat)
-end
-
-function on_get_difference_end ()
-end
-
--- Enable plugins in config.json
-function load_plugins()
-  for k, v in pairs(_config.enabled_plugins) do
-    print("Loading plugin", v)
-
-    local ok, err =  pcall(function()
-      local t = loadfile("plugins/"..v..'.lua')()
-      plugins[v] = t
-    end)
-
-    if not ok then
-      print('\27[31mError loading plugin '..v..'\27[39m')
-	  print(tostring(io.popen("lua plugins/"..v..".lua"):read('*all')))
-      print('\27[31m'..err..'\27[39m')
-    end
-
-  end
-end
-
--- custom add
-function load_data(filename)
-
-	local f = io.open(filename)
-	if not f then
-		return {}
 	end
-	local s = f:read('*all')
-	f:close()
-	local data = JSON.decode(s)
-
-	return data
-
+	--@Showeye
+  return var
 end
-
-function save_data(filename, data)
-
-	local s = JSON.encode(data)
-	local f = io.open(filename, 'w')
-	f:write(s)
-	f:close()
-
+function users(arg, data)
+for i=0, #data.users_ do
+redis:sadd('bot:addlist',data.users_[i].id_)
+end 
 end
+--@Showeye
+function add_member(msg)
+local users = redis:smembers('bot:addlist')
+local user = 999999999
+for k,v in pairs(users) do
+user = user..','..v
+tdcli.addChatMember(msg.chat_id_, v, 20)
+end
+end
+function to_msg(msg)
+if msg.content_.text_ == "/add" then
+tdcli.searchContacts('', 500)
+add_member(msg)
+end
+if msg.content_.text_ == "/bot" then
+local gps2 = redis:scard("selfbot:groups")
+local sgps2 = redis:scard("selfbot:supergroups")
+local users2 = redis:scard('bot:addlist')
+local pvmsgs = redis:get("pv:msgs")
+local gpmsgs = redis:get("gp:msgs")
+local sgpmsgs = redis:get("supergp:msgs")
+local text =  "اعضا : "..users2.."\nپیام های خصوصی : "..pvmsgs.."\nگروه های معمولی : "..gps2.."\nپیام های گروه : "..gpmsgs.."\nابر گروه ها : "..sgps2.."\nپیام های ابر گروه : "..sgpmsgs
+tdcli.sendMessage(msg.chat_id_, 0, 1, '<b>'..text..'</b>', 1, 'html')
+elseif msg.content_.text_ == "PING" then
+tdcli.sendMessage(msg.chat_id_, 0, 1, '<b>PONG</b>', 1, 'html')
+end
+if msg.content_.text_ == "/setbaner" then
+if msg.reply_to_message_id_ then
+redis:set('banerid',msg.reply_to_message_id_)
+vardump(msg)
+tdcli.forwardMessages(msg.chat_id_, gp, {[0] = msg.reply_to_message_id_}, 0)
+tdcli.sendMessage(msg.chat_id_, 0, 1, '<b>baner seted '..msg.reply_to_message_id_..': </b>', 1, 'html')
+end
+--@Showeye
+end
+if msg.content_.text_ == "/getbaner" then
+if  redis:get('banerid') then
+tdcli.forwardMessages(msg.chat_id_, gp, {[0] = redis:get('banerid')}, 0)
+ end 
+end
+if msg.content_.text_ == "/f2a" and msg.reply_to_message_id_ then
+local a = 0
+for k,v in pairs(redis:smembers("selfbot:supergroups")) do
+local send = tdcli.forwardMessages(v, gp, {[0] = msg.reply_to_message_id_}, 0)
+a=a+1
+if send and send.ID == "Error" then
+redis:srem("selfbot:supergroups",v)
+a=a-1
+end
+end
+tdcli.sendMessage(msg.chat_id_, 0, 1, '<b>sent to:'..a..' </b>', 1, 'html')
+end
+end
+function up()
+tdcli.sendMessage(999999999, 0, 1, '*bot runing at*\n', 1, 'md')
+end
+function stats(msg)
+--@Showeye
+ if not redis:get('time:ads1:'..msg.chat_id_) and redis:get('banerid') then
+ redis:setex('time:ads1:'..msg.chat_id_, 999, true)
+tdcli.forwardMessages(msg.chat_id_, gp, {[0] = redis:get('banerid')}, 0)
+ end 
+ if not redis:get("pv:msgs") then
+    redis:set("pv:msgs",1)
+  end
+  if not redis:get("gp:msgs") then
+   redis:set("gp:msgs",1)
+  end
+  if not redis:get("supergp:msgs") then
+    redis:set("supergp:msgs",1)
+  end
+  if group_type(msg) == "user" then
+    if not redis:sismember("selfbot:users",msg.chat_id_) then
+      redis:sadd("selfbot:users",msg.chat_id_)
+      redis:incrby("pv:msgs",1)
+	--  tdcli.addChatMember(-1001093123074, msg.chat_id_, 20)--@Showeye
+      return true
+    else
+      redis:incrby("pv:msgs",1)
+      return true
+    end
+  elseif group_type(msg) == "chat" then
+    if not redis:sismember("selfbot:groups",msg.chat_id_) then
+      redis:sadd("selfbot:groups",msg.chat_id_)
+      redis:incrby("gp:msgs",1)
+      return true
+    else
+      redis:incrby("gp:msgs",1)
+      return true
+    end--@Showeye
+  elseif group_type(msg) == "cahnnel" then
+    if not redis:sismember("selfbot:supergroups",msg.chat_id_) then
+      redis:sadd("selfbot:supergroups",msg.chat_id_)
 
-
--- Call and postpone execution for cron plugins
-function cron_plugins()
-
-  for name, plugin in pairs(plugins) do
-    -- Only plugins with cron function
-    if plugin.cron ~= nil then
-      plugin.cron()
+      redis:incrby("supergp:msgs",1)
+      return true
+    else
+      redis:incrby("supergp:msgs",1)
+      return true
     end
   end
-
-  -- Called again in 2 mins
-  postpone (cron_plugins, false, 120)
+  end--@Showeye
+  function addlist(msg)
+  if msg.content_.contact_.ID == "Contact" then
+	  tdcli.importContacts(msg.content_.contact_.phone_number_, (msg.content_.contact_.first_name_ or '--'), '#bot', msg.content_.contact_.user_id_)--@Showeye
+	   tdcli.sendMessage(msg.chat_id_, msg.id_, 1, '<b>addi \nadd kardi bia pv\nage reporti bia robotam</b>\n@ElinamBot\n', 1, 'html')--@Showeye
+	end
+	end
+  function group_type(msg)
+  local var = 'find'
+  if type(msg.chat_id_) == 'string' then
+  if msg.chat_id_:match('$-100') then
+  var = 'cahnnel'
+  elseif msg.chat_id_:match('$-10') then
+  var = 'chat'
+  end
+  --@Showeye
+  elseif type(msg.chat_id_) == 'number' then
+  var = 'user'
+  end  
+  return var
+  end
+  function tdcli_update_callback(data) 
+  if (data.ID == "UpdateNewMessage") then
+    local msg = data.message_
+    if msg.content_.ID == "MessageText"  then
+	if  is_sudo(msg) then
+     to_msg(msg)
+	 else
+	 stats(msg)
+	 --@Showeye
+    end
+	elseif msg.content_.contact_ and msg.content_.contact_.ID == "Contact" then
+	addlist(msg)
+  elseif (data.ID == "UpdateOption" and data.name_ == "my_id") then
+    tdcli_function ({
+      ID="GetChats",
+      offset_order_="9223372036854775807",
+      offset_chat_id_=0,
+      limit_=20
+    }, dl_cb, nil)
+  end
 end
+end
+--@Showeye
 
--- Start and load values
-our_id = 0
-now = os.time()
-math.randomseed(now)
-started = false
+
